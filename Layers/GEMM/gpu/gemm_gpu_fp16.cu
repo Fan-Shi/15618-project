@@ -35,6 +35,68 @@ __global__ void gemmBasicKernelFp16(const half *A, const half *B, half *C, int M
     }
 }
 
+// Different from normal tiled gemm kernel. This kernel will use w whole warp to compute a 16 x 16 output tile. 
+// We use same setting as tensor core kernel. Each block will contain 4 warps (128 threads)
+// The assignment for loading ofr input tile and computation within output tile is 
+// 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+// 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+// 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+// 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+// 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+// 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+// ...............................................
+// In this way. Each thread will need to loop on row index of tiles. This way will best resolve bank conflict
+// This kernel will simulate the behavior of tensor core (warp level MMA). However, tensorcore paradigm will 
+// load data directly into register which is faster than this dem0
+__global__ void gemmWarpTilingKernelFp16(const half *A, const half *B, half *C, int M, int N, int K) {
+    __shared__ half aTile[2 * TILE_WIDTH][2 * TILE_WIDTH];
+    __shared__ half bTile[2 * TILE_WIDTH][2 * TILE_WIDTH];
+
+    int tileAIndex = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int tileBIndex = (blockIdx.y * blockDim.y + threadIdx.y);
+
+    int rowAStartIndex = tileAIndex * TILE_WIDTH;
+    int rowBStartIndex = tileBIndex * TILE_WIDTH;
+
+    int sharedMemOffsetX = (threadIdx.x / WARP_SIZE) * TILE_WIDTH;
+    int sharedMemOffsetY = threadIdx.y * TILE_WIDTH;
+
+    int tId = threadIdx.x % TILE_WIDTH;
+    int tgroup = (threadIdx.x % WARP_SIZE) / TILE_WIDTH;
+    half outputVal[TILE_WIDTH * TILE_WIDTH / WARP_SIZE];  // Each thread will be responsible a series of output value
+
+    #pragma unroll
+    for(int idx = 0; idx < (TILE_WIDTH * TILE_WIDTH / WARP_SIZE); idx++) {
+        outputVal[idx] = __float2half(0.0f);
+    }
+
+    for(int kdx = 0; kdx < K; kdx += TILE_WIDTH) {
+        const half* tiledInputA = A + rowAStartIndex * K + kdx;
+        const half* tiledInputB = B + rowBStartIndex * K + kdx;
+        // Load data into shared memory. Notice the shared memory is of shape 32 * 32 and each warp will only take one of 16 x 16 block
+        #pragma unroll 
+        for (int i = 0; i < TILE_WIDTH; i+=2) {
+            aTile[sharedMemOffsetX + i + tgroup][sharedMemOffsetY + tId] = tiledInputA[(i + tgroup) * K + tId];
+            bTile[sharedMemOffsetX + i + tgroup][sharedMemOffsetY + tId] = tiledInputB[(i + tgroup) * K + tId];
+        }
+        
+        #pragma unroll
+        for(int iter = 0; iter < TILE_WIDTH; iter++) {
+            half bElem = bTile[sharedMemOffsetX + tId][sharedMemOffsetY + iter];
+            #pragma unroll
+            for(int i = 0; i < (TILE_WIDTH * TILE_WIDTH / WARP_SIZE); i++) {
+                outputVal[i] = __hfma(aTile[sharedMemOffsetX + i * 2 + tgroup][sharedMemOffsetY + iter], bElem, outputVal[i]);
+            }
+        }
+    }
+
+    // Store all the results back to global memory 
+    #pragma unroll
+    for(int i = 0; i < (TILE_WIDTH * TILE_WIDTH / WARP_SIZE); i++) {
+        C[(rowAStartIndex + i * 2 + tgroup) * N + rowBStartIndex + tId] = outputVal[i];
+    }
+}
+
 __global__ void gemmTensorCoreKernelFp16(const half *A, const half *B, half *C, int M, int N, int K) {
     // Each block contains 4 warps, with 2 x 2 latout. 
     // Each Warp contain 32 threads, and will be responsible for compute 16 x 16 output tile using tensor core
@@ -114,6 +176,20 @@ void runExperimentFp16(int m, int n, int k) {
     dim3 gridDim(m / (2 * TILE_WIDTH), n / (2 * TILE_WIDTH), 1);
     dim3 blockDim(2 * WARP_SIZE, 2, 1);
 
+    cudaEventRecord(start, 0);
+    gemmWarpTilingKernelFp16<<<gridDim, blockDim>>>(deviceA, deviceB, deviceC, m, n, k);
+    cudaEventRecord(stop, 0);
+
+    cudaEventSynchronize(stop);
+    float warpTiledGemmFp16Millis = 0.0f;
+    cudaEventElapsedTime(&warpTiledGemmFp16Millis, start, stop);
+    std::cout << "case " << k <<" Tensor Core GEMM gpu take " << warpTiledGemmFp16Millis << " to complete." << std::endl;
+
+    error = cudaGetLastError();
+    if(error!=cudaSuccess) {
+        fprintf(stderr,"ERROR Warp : %s\n", cudaGetErrorString(error) );
+        exit(-1);
+    }
 
     cudaEventRecord(start, 0);
     gemmTensorCoreKernelFp16<<<gridDim, blockDim>>>(deviceA, deviceB, deviceC, m, n, k);
