@@ -97,6 +97,27 @@ __global__ void gemmWarpTilingKernelFp16(const half *A, const half *B, half *C, 
     }
 }
 
+
+/*
+__global__ void gemmWarpSyncTilingKernelFp16(const half *A, const half *B, half *C, int M, int N, int K) {
+    // Put memory directly into register file instead of shared memory
+    half aTile[TILE_WIDTH];
+    half bTile[TILE_WIDTH];
+
+    int tileAIndex = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int tileBIndex = (blockIdx.y * blockDim.y + threadIdx.y);
+
+    int rowAStartIndex = tileAIndex * TILE_WIDTH;
+    int rowBStartIndex = tileBIndex * TILE_WIDTH;
+
+    int lineId = threadIdx.x % TILE_WIDTH;
+    half outputVal[TILE_WIDTH * TILE_WIDTH / WARP_SIZE];  // Each thread will be responsible a series of output value
+
+    #pragma unroll
+    for(int idx = 0; idx < (TILE_WIDTH * TILE_WIDTH / WARP_SIZE); idx++) {
+        outputVal[idx] = __float2half(0.0f);
+    }
+}*/
 __global__ void gemmTensorCoreKernelFp16(const half *A, const half *B, half *C, int M, int N, int K) {
     // Each block contains 4 warps, with 2 x 2 latout. 
     // Each Warp contain 32 threads, and will be responsible for compute 16 x 16 output tile using tensor core
